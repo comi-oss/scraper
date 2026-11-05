@@ -74,7 +74,24 @@ fn required_fields(value: &Value, schema: &Value) -> Result<()> {
 }
 
 pub(crate) fn parse(raw: &str) -> Result<Catalog> {
-    let value: Value = serde_json::from_str(raw).context("model returned invalid JSON")?;
+    let mut value: Value = serde_json::from_str(raw).context("model returned invalid JSON")?;
+    // Some vision models return the schema's item list directly instead of the
+    // enclosing catalog object. Preserve those extracted items with empty
+    // catalog metadata; the normal item schema validation below still applies.
+    if value.as_array().is_some_and(|entries| {
+        entries.len() == 1
+            && entries[0].is_object()
+            && entries[0].get("items").is_some_and(Value::is_array)
+    }) {
+        value = value.as_array_mut().expect("checked array").remove(0);
+    } else if value.is_array() {
+        value = json!({
+            "circle_name": null,
+            "booth_codes": [],
+            "items": value,
+            "notes": []
+        });
+    }
     let schema = schema();
     required_fields(&value, &schema)?;
     for item in value["items"]
@@ -131,7 +148,7 @@ impl<'a> Vlm<'a> {
             key,
             interval,
             endpoint: API,
-            enforce_quota: true,
+            enforce_quota: model.ends_with(":free"),
         }
     }
 
@@ -139,12 +156,8 @@ impl<'a> Vlm<'a> {
         if self.enforce_quota && crate::quota::remaining(self.http, self.key)? == Some(0) {
             return Err(crate::quota::Stop::DailyQuota.into());
         }
-        ensure!(
-            self.model.ends_with(":free"),
-            "only :free models are allowed"
-        );
         let body = json!({"model":self.model,"temperature":0,"max_tokens":10000,
-            "reasoning":{"enabled":false},"provider":{"max_price":{"prompt":0,"completion":0}},
+            "reasoning":{"enabled":false},
             "messages":[{"role":"user","content":[{"type":"text","text":PROMPT},
                 {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{}",STANDARD.encode(jpeg))}}]}],
             "response_format":{"type":"json_schema","json_schema":{"name":"catalog","strict":true,"schema":schema()}}});
@@ -333,7 +346,10 @@ pub(crate) fn process(
             if !storage::cached(db, &key)? {
                 let catalog = vlm.extract(&jpeg)?;
                 db.execute(
-                    "INSERT INTO extractions VALUES (?1,?2,?3,?4,?5)",
+                    // Another worker may finish the same image while this
+                    // request is in flight. Keep its validated extraction and
+                    // associate this source with that existing cache entry.
+                    "INSERT INTO extractions VALUES (?1,?2,?3,?4,?5) ON CONFLICT(cache_key) DO NOTHING",
                     params![
                         key,
                         digest,
@@ -380,6 +396,14 @@ pub(crate) fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_single_catalog_array_without_treating_catalog_as_an_item() {
+        let wrapped = json!([fixture()]);
+        let catalog = parse(&wrapped.to_string()).unwrap();
+        assert_eq!(catalog.items.len(), 1);
+        assert_eq!(catalog.items[0].name, "Cat sticker");
+    }
+
     fn fixture() -> Value {
         json!({"circle_name":"Test","booth_codes":["A-01a"],"notes":[],"items":[{
             "name":"Cat sticker","category":"sticker","fandom":null,"characters":[],
@@ -412,7 +436,7 @@ mod tests {
             .mock("POST", "/")
             .match_header("authorization", "Bearer test-key")
             .match_body(mockito::Matcher::PartialJson(
-                json!({"model":crate::MODEL,"provider":{"max_price":{"prompt":0,"completion":0}}}),
+                json!({"model":crate::MODEL}),
             ))
             .with_status(200)
             .with_body(response.to_string())

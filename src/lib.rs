@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{path::PathBuf, time::Duration};
 
-const MODEL: &str = "nvidia/nemotron-3.5-super-vl:free";
+const MODEL: &str = "qwen/qwen3.8-flash";
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +63,9 @@ enum Command {
         max_images: usize,
         #[arg(long,default_value="4",value_parser=interval)]
         interval: f64,
+        /// Number of circles to process concurrently.
+        #[arg(long, default_value="1", value_parser=positive)]
+        concurrency: usize,
         /// Upload catalog results to an already initialized D1 database every five sources.
         #[arg(long)]
         upload: bool,
@@ -185,6 +188,7 @@ pub fn run() -> Result<()> {
             limit,
             max_images,
             interval,
+            concurrency,
             upload,
             retry_failed,
         } => batch::run(
@@ -194,6 +198,7 @@ pub fn run() -> Result<()> {
             limit,
             max_images,
             interval,
+            concurrency,
             upload,
             retry_failed,
         )?,
@@ -265,7 +270,6 @@ fn ingest(
         .context("set OPENROUTER_API_KEY in your environment or .env")?;
     ensure!(!key.trim().is_empty(), "OPENROUTER_API_KEY is empty");
     let model = std::env::var("OPENROUTER_MODEL").unwrap_or_else(|_| MODEL.into());
-    ensure!(model.ends_with(":free"), "only :free models are allowed");
     let http = net::Http::new()?;
     let vlm = catalog::Vlm::new(
         &http,

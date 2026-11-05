@@ -51,6 +51,7 @@ pub(crate) fn run(
     limit: usize,
     max_images: usize,
     interval: f64,
+    concurrency: usize,
     upload: bool,
     retry_failed: bool,
 ) -> Result<()> {
@@ -61,7 +62,7 @@ pub(crate) fn run(
         limit,
         max_images,
         interval,
-        1,
+        concurrency,
         upload,
         retry_failed,
     )?;
