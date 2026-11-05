@@ -17,7 +17,10 @@ pub(crate) fn parent(path: &Path) -> Result<()> {
 pub(crate) fn open(path: &Path) -> Result<Connection> {
     parent(path)?;
     let db = Connection::open(path).context("could not open SQLite database")?;
-    db.execute_batch("PRAGMA foreign_keys = ON;")?;
+    db.busy_timeout(std::time::Duration::from_secs(60))?;
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
+    )?;
     db.execute_batch(SCHEMA)?;
     backfill(&db)?;
     Ok(db)

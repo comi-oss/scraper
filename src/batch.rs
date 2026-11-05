@@ -1,6 +1,15 @@
 use crate::{ExtractionOptions, d1::D1, ingest};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
+use std::{
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 fn candidates(
     db: &Connection,
@@ -21,7 +30,8 @@ fn candidates(
           AND ((NOT ?2 AND (a.status IS NULL OR
                (a.status='processed' AND s.url LIKE '%instagram.com/%' AND coverage.method IS NULL)))
                OR (?2 AND a.status='failed'))
-        ) SELECT circle_id,url,display_name FROM ranked WHERE rank=1 ORDER BY display_name LIMIT ?3";
+        ) SELECT circle_id,url,display_name FROM ranked
+          WHERE ?2 OR rank=1 ORDER BY display_name,url LIMIT ?3";
     let mut statement = db.prepare(sql)?;
     Ok(statement
         .query_map(params![event, retry_failed, i64::try_from(limit)?], |r| {
@@ -36,6 +46,7 @@ fn candidates(
 
 pub(crate) fn run(
     db: &Connection,
+    db_path: &Path,
     event: &str,
     limit: usize,
     max_images: usize,
@@ -43,7 +54,17 @@ pub(crate) fn run(
     upload: bool,
     retry_failed: bool,
 ) -> Result<()> {
-    let (_, failed) = run_batch(db, event, limit, max_images, interval, upload, retry_failed)?;
+    let (_, failed) = run_batch(
+        db,
+        db_path,
+        event,
+        limit,
+        max_images,
+        interval,
+        1,
+        upload,
+        retry_failed,
+    )?;
     ensure!(
         failed == 0,
         "{failed} sources failed; successful pages are saved"
@@ -53,10 +74,12 @@ pub(crate) fn run(
 
 fn run_batch(
     db: &Connection,
+    db_path: &Path,
     event: &str,
     limit: usize,
     max_images: usize,
     interval: f64,
+    concurrency: usize,
     upload: bool,
     retry_failed: bool,
 ) -> Result<(usize, usize)> {
@@ -65,73 +88,144 @@ fn run_batch(
         return Ok((0, 0));
     }
     println!(
-        "Starting real {event} batch: {} circles, at most {max_images} images per post",
-        sources.len()
+        "Starting real {event} batch: {} circles, at most {max_images} images per post, concurrency {concurrency}",
+        sources.len(),
     );
-    let mut processed = 0;
-    let mut failed = 0;
-    for (index, (circle, source, name)) in sources.iter().enumerate() {
-        println!("[{}/{}] {name}: {source}", index + 1, sources.len());
-        let options = ExtractionOptions {
-            circle: circle.clone(),
-            max_images,
-            interval,
-        };
-        let result = ingest(db, std::slice::from_ref(source), &options);
-        if let Err(error) = &result
-            && error.downcast_ref::<crate::quota::Stop>().is_some()
-        {
-            // Leave this source unattempted (or failed during a retry pass), so a
-            // resumed process continues cached pages before spending more quota.
-            if upload {
-                D1::from_env()?.push(db, true)?;
+    let sources = Arc::new(sources);
+    let next = AtomicUsize::new(0);
+    let processed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let signal = Mutex::new(None);
+    let worker_count = concurrency.min(sources.len());
+    let worker_results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sources = Arc::clone(&sources);
+            let db_path = db_path.to_path_buf();
+            let next = &next;
+            let processed = &processed;
+            let failed = &failed;
+            let stop = &stop;
+            let signal = &signal;
+            handles.push(scope.spawn(move || -> Result<()> {
+                let worker_db = Connection::open(&db_path)
+                    .with_context(|| format!("worker could not open {}", db_path.display()))?;
+                worker_db.busy_timeout(Duration::from_secs(60))?;
+                worker_db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::AcqRel);
+                    let Some((circle, source, name)) = sources.get(index) else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    println!("[{}/{}] {name}: {source}", index + 1, sources.len());
+                    let options = ExtractionOptions {
+                        circle: circle.clone(),
+                        max_images,
+                        interval,
+                    };
+                    let result = ingest(&worker_db, std::slice::from_ref(source), &options);
+                    if let Err(error) = &result
+                        && let Some(quota) = error.downcast_ref::<crate::quota::Stop>()
+                    {
+                        let kind = match quota {
+                            crate::quota::Stop::DailyQuota => Signal::DailyQuota,
+                            crate::quota::Stop::RateLimit => Signal::RateLimit,
+                            crate::quota::Stop::Authentication => Signal::Authentication,
+                        };
+                        *signal.lock().expect("worker stop signal mutex poisoned") = Some(kind);
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    let detail = match &result {
+                        Ok(()) => "public catalog images processed".into(),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    worker_db.execute("INSERT INTO scrape_attempts VALUES (?1,?2,?3,?4,?5) ON CONFLICT(circle_id,source_url) DO UPDATE SET status=excluded.status,detail=excluded.detail,attempted_at=excluded.attempted_at",
+                        params![circle,source,if result.is_ok(){"processed"}else{"failed"},detail,chrono::Utc::now().to_rfc3339()])?;
+                    if result.is_ok() {
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let stop_signal = if detail.contains("OpenRouter HTTP 429") {
+                        Some(Signal::RateLimit)
+                    } else if ["OpenRouter HTTP 401", "OpenRouter HTTP 402", "OpenRouter HTTP 403"]
+                        .iter().any(|code| detail.contains(code)) {
+                        Some(Signal::Authentication)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = stop_signal {
+                        *signal.lock().expect("worker stop signal mutex poisoned") = Some(kind);
+                        stop.store(true, Ordering::Release);
+                    }
+                    let count: i64 = worker_db.query_row(
+                        "SELECT COUNT(*) FROM event_items WHERE event_id=?1",
+                        [event],
+                        |row| row.get(0),
+                    )?;
+                    println!(
+                        "Batch progress: {} processed, {} failed; {count} current {event} item observations",
+                        processed.load(Ordering::Relaxed),
+                        failed.load(Ordering::Relaxed),
+                    );
+                }
+                Ok(())
+            }));
+        }
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(_) => errors.push(anyhow::anyhow!("scrape worker panicked")),
             }
-            return Err(result.err().context("missing quota error")?);
         }
-        let detail = match &result {
-            Ok(()) => "public catalog images processed".into(),
-            Err(e) => format!("{e:#}"),
-        };
-        // ingest reports individual errors to stderr. Retain a concise batch status.
-        db.execute("INSERT INTO scrape_attempts VALUES (?1,?2,?3,?4,?5) ON CONFLICT(circle_id,source_url) DO UPDATE SET status=excluded.status,detail=excluded.detail,attempted_at=excluded.attempted_at",
-            params![circle,source,if result.is_ok(){"processed"}else{"failed"},detail,chrono::Utc::now().to_rfc3339()])?;
-        if result.is_ok() {
-            processed += 1;
-        } else {
-            failed += 1;
+        errors
+    });
+    if let Some(error) = worker_results.into_iter().next() {
+        return Err(error);
+    }
+    let processed = processed.load(Ordering::Relaxed);
+    let failed = failed.load(Ordering::Relaxed);
+    if let Some(signal) = *signal.lock().expect("worker stop signal mutex poisoned") {
+        if upload {
+            D1::from_env()?.push(db, true)?;
         }
-        if [
-            "OpenRouter HTTP 429",
-            "OpenRouter HTTP 401",
-            "OpenRouter HTTP 402",
-            "OpenRouter HTTP 403",
-        ]
-        .iter()
-        .any(|code| detail.contains(code))
-        {
-            if upload {
-                D1::from_env()?.push(db, true)?;
-            }
-            anyhow::bail!(
-                "stopped batch after OpenRouter quota/authentication error; progress saved"
-            );
-        }
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM event_items WHERE event_id=?1",
-            [event],
-            |r| r.get(0),
-        )?;
-        println!(
-            "Batch progress: {processed} processed, {failed} failed; {count} current {event} item observations"
-        );
-        if upload && ((index + 1) % 5 == 0 || index + 1 == sources.len()) {
-            D1::from_env()?
-                .push(db, true)
-                .context("catalogs saved locally, but D1 upload failed")?;
-        }
+        return Err(signal.into_error());
+    }
+    if upload {
+        D1::from_env()?
+            .push(db, true)
+            .context("catalogs saved locally, but D1 upload failed")?;
     }
     println!("Batch finished: {processed} processed sources, {failed} failed sources");
     Ok((processed, failed))
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    DailyQuota,
+    RateLimit,
+    Authentication,
+}
+
+impl Signal {
+    fn into_error(self) -> anyhow::Error {
+        let stop = match self {
+            Self::DailyQuota => crate::quota::Stop::DailyQuota,
+            Self::RateLimit => crate::quota::Stop::RateLimit,
+            Self::Authentication => crate::quota::Stop::Authentication,
+        };
+        stop.into()
+    }
 }
 
 fn state(
@@ -193,10 +287,12 @@ fn wait_for_capacity(
 
 pub(crate) fn all(
     db: &Connection,
+    db_path: &Path,
     event: &str,
     batch_size: usize,
     max_images: usize,
     interval: f64,
+    concurrency: usize,
     upload: bool,
     wait: bool,
 ) -> Result<()> {
@@ -223,7 +319,17 @@ pub(crate) fn all(
         if candidates(db, event, batch_size, false)?.is_empty() {
             break;
         }
-        match run_batch(db, event, batch_size, max_images, interval, false, false) {
+        match run_batch(
+            db,
+            db_path,
+            event,
+            batch_size,
+            max_images,
+            interval,
+            concurrency,
+            false,
+            false,
+        ) {
             Ok(_) => {
                 state(
                     db,
@@ -260,10 +366,12 @@ pub(crate) fn all(
         loop {
             match run_batch(
                 db,
+                db_path,
                 event,
                 usize::try_from(failed)?,
                 max_images,
                 interval,
+                concurrency,
                 false,
                 true,
             ) {
@@ -330,13 +438,24 @@ mod tests {
             )
             .unwrap();
         }
+        db.execute(
+            "INSERT INTO sources VALUES ('failed','https://www.instagram.com/p/ALTERNATE/','CF23 catalog')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO scrape_attempts VALUES ('failed','https://www.instagram.com/p/ALTERNATE/','failed','result','now')",
+            [],
+        )
+        .unwrap();
         db.execute("INSERT INTO results VALUES ('interrupted','https://x.com/interrupted/status/123','image','cached')",[]).unwrap();
         let regular = candidates(&db, "cf23", 25, false).unwrap();
         assert_eq!(regular.len(), 1);
         assert_eq!(regular[0].0, "interrupted");
         let retry = candidates(&db, "cf23", 25, true).unwrap();
-        assert_eq!(retry.len(), 1);
+        assert_eq!(retry.len(), 2);
         assert_eq!(retry[0].0, "failed");
+        assert_eq!(retry[1].0, "failed");
         assert!(candidates(&db, "cf24", 25, false).unwrap().is_empty());
         db.execute_batch("INSERT INTO circles VALUES ('preview','Preview','{}');
             INSERT INTO circle_profiles VALUES ('preview','Preview');

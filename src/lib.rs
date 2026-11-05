@@ -45,6 +45,9 @@ enum Command {
         max_images: usize,
         #[arg(long,default_value="4",value_parser=interval)]
         interval: f64,
+        /// Number of circles to process concurrently.
+        #[arg(long, default_value="1", value_parser=positive)]
+        concurrency: usize,
         #[arg(long)]
         upload: bool,
         #[arg(long)]
@@ -163,14 +166,17 @@ pub fn run() -> Result<()> {
             batch_size,
             max_images,
             interval,
+            concurrency,
             upload,
             wait_for_quota,
         } => batch::all(
             &db,
+            &cli.db,
             &event,
             batch_size,
             max_images,
             interval,
+            concurrency,
             upload,
             wait_for_quota,
         )?,
@@ -183,6 +189,7 @@ pub fn run() -> Result<()> {
             retry_failed,
         } => batch::run(
             &db,
+            &cli.db,
             &event,
             limit,
             max_images,

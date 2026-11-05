@@ -4,6 +4,10 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+const configuredImageWait = Number(process.env.COMI_INSTAGRAM_IMAGE_TIMEOUT_MS ?? 60000);
+const IMAGE_WAIT_TIMEOUT_MS = Number.isInteger(configuredImageWait) && configuredImageWait >= 5000 && configuredImageWait <= 180000
+  ? configuredImageWait : 60000;
+
 export function normalizePostUrl(raw) {
   const url = new URL(raw);
   if (url.protocol !== 'https:' || !['instagram.com', 'www.instagram.com'].includes(url.hostname)) {
@@ -44,9 +48,9 @@ async function visibleImage(page, scoped = true) {
       }
       const width = Math.max(0, right-left), height = Math.max(0, bottom-top);
       if (width < 200 || height < 200 || width*height < r.width*r.height*0.9) return [];
-      const hit = document.elementFromPoint((left+right)/2,(top+bottom)/2);
-      if (!hit || !(hit === img || img.contains(hit) || hit.contains(img) ||
-          (root !== document && root.contains(hit) && !hit.closest('[role="dialog"]')))) return [];
+      // Instagram's controls and carousel overlay can cover the image center;
+      // the separate blocking-prompt check handles modal screens.
+      if (getComputedStyle(img).visibility !== 'visible' || Number(getComputedStyle(img).opacity) < 0.1) return [];
       return [{ img, area: width*height, source: img.currentSrc, width: r.width, height: r.height }];
     }).sort((a,b) => b.area-a.area);
     const best = candidates[0];
@@ -66,6 +70,30 @@ async function visibleImage(page, scoped = true) {
   return found && { ...found, locator: page.locator('[data-comi-active-image]').first() };
 }
 
+async function waitForStableImage(page, { scoped = true, previous = null, timeout = IMAGE_WAIT_TIMEOUT_MS } = {}) {
+  const deadline = Date.now() + timeout;
+  let candidate = null, stableSince = 0;
+  while (Date.now() < deadline) {
+    const image = await visibleImage(page, scoped);
+    if (image && (!previous || imageIdentity(image.source) !== imageIdentity(previous.source))) {
+      // Decode before accepting an image; require the same source and dimensions
+      // to persist briefly so lazy loading and layout shifts have settled.
+      const decoded = await image.locator.evaluate(img => img.decode().then(() => true, () => false)).catch(() => false);
+      const signature = `${imageIdentity(image.source)}:${image.width}x${image.height}`;
+      if (decoded && candidate === signature) {
+        if (Date.now() - stableSince >= 700) return image;
+      } else {
+        candidate = decoded ? signature : null;
+        stableSince = Date.now();
+      }
+    } else {
+      candidate = null;
+    }
+    await page.waitForTimeout(250);
+  }
+  throw new Error(`Timed out waiting ${timeout / 1000}s for a decoded, stable post image`);
+}
+
 function imageIdentity(source) {
   try { const url = new URL(source); return url.origin + url.pathname; } catch { return source; }
 }
@@ -73,16 +101,8 @@ function imageIdentity(source) {
 async function navigate(page, direction, previous) {
   const button = page.locator('[data-comi-carousel]').getByRole('button', { name: direction, exact: true }).first();
   if (!(await button.isVisible().catch(() => false)) || await button.isDisabled()) return null;
-  await button.click({ timeout: 4000 });
-  for (let attempt = 0; attempt < 24; attempt++) {
-    await page.waitForTimeout(200);
-    const next = await visibleImage(page);
-    if (next && imageIdentity(next.source) !== imageIdentity(previous.source)) {
-      await page.waitForTimeout(250);
-      return await visibleImage(page);
-    }
-  }
-  throw new Error(`Carousel ${direction} click did not reveal a new image`);
+  await button.click({ timeout: 8000 });
+  return waitForStableImage(page, { previous, timeout: IMAGE_WAIT_TIMEOUT_MS });
 }
 
 export async function captureCarousel(page, { output, sourceUrl, maxSlides = 20 }) {
@@ -95,8 +115,7 @@ export async function captureCarousel(page, { output, sourceUrl, maxSlides = 20 
     if (await remainingPrompt.isVisible().catch(() => false)) throw new Error('A blocking Instagram prompt could not be dismissed');
     await page.screenshot({ path: resolve(output, 'after-dismiss.png') });
     if (/\/accounts\/(login|signup)|\/challenge\//.test(new URL(page.url()).pathname)) throw new Error('Instagram requires login or a challenge');
-    let current = await visibleImage(page, false);
-    if (!current) throw new Error('No visible post image after closing the popup');
+    let current = await waitForStableImage(page, { scoped: false, timeout: IMAGE_WAIT_TIMEOUT_MS });
     // A post URL can open on a later slide. Rewind using the public UI first.
     for (let count = 0; count < maxSlides; count++) {
       const previous = await navigate(page, 'Previous', current);
@@ -107,8 +126,7 @@ export async function captureCarousel(page, { output, sourceUrl, maxSlides = 20 
     const seen = new Set();
     for (let index = 1; index <= maxSlides; index++) {
       manifest.popup_dismissals += await dismissOverlays(page);
-      current = await visibleImage(page);
-      if (!current) throw new Error('Post image is no longer visible');
+      current = await waitForStableImage(page, { timeout: IMAGE_WAIT_TIMEOUT_MS });
       const identity = imageIdentity(current.source);
       if (seen.has(identity)) throw new Error('Carousel repeated an image before reaching its end');
       seen.add(identity);
@@ -157,7 +175,6 @@ async function main() {
     let manifest;
     try {
       await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(5000);
       manifest = await captureCarousel(page, { output, sourceUrl, maxSlides });
     } catch (error) {
       manifest = {source_url:sourceUrl,captured_at:new Date().toISOString(),status:'blocked',reason:error.message,popup_dismissals:0,slides:[]};

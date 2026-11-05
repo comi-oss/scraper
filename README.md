@@ -30,15 +30,25 @@ cargo run -- scrape --event cf23 --limit 25 --max-images 20 --upload
 # Retry failed sources in a later batch:
 cargo run -- scrape --event cf23 --limit 25 --max-images 20 --upload --retry-failed
 # Process the remaining queue and wait for daily free quota resets:
-cargo run -- scrape-all --event cf23 --batch-size 25 --max-images 20 --upload --wait-for-quota
+cargo run -- scrape-all --event cf23 --batch-size 25 --max-images 20 --concurrency 3 --upload --wait-for-quota
 ```
 
 The batch prioritizes public X photo posts with catalog captions. `scrape_attempts`
 records processed/failed sources; processed means the requested image budget was
 handled, not that a circle's entire catalog/thread was retrieved. Without
-`--retry-failed`, subsequent batches skip recorded failures. Results upload every
-five sources with `--upload`. D1 must already contain the event/booth metadata.
+`--retry-failed`, subsequent batches skip recorded failures. `scrape-all`
+defaults to one worker; `--concurrency 3` processes up to three circles at once.
+Results upload at each batch checkpoint with `--upload`. D1 must already contain
+the event/booth metadata.
 Quota/authentication errors stop the batch after saving progress.
+
+Before extracting X images, the scraper checks the public syndication response
+matches the requested post ID and contains that post's photos. If syndication
+omits photos, it checks the matching public status page and accepts only full-size
+X media images. Instagram preflight checks that the public HTML stays on the same
+post; when preview metadata is present, it must point to Instagram's media CDN.
+Missing preview metadata still proceeds to Playwright, which checks the visible
+post and captures its carousel.
 
 Use the exact circle ID returned by `list`. Ingest also accepts direct HTTP(S)
 image URLs and public HTML catalog pages. Place `--db path/to/db.sqlite` before
@@ -94,10 +104,14 @@ compact X links are decoded; circle IDs include the event date and upstream inde
 The map links mostly to X/Instagram catalog posts. X photo discovery uses its public
 syndication/embed endpoint, checking the requested post ID and selecting only that
 post's attached photos (excluding avatars and quoted posts). This endpoint is
-best-effort and may change; protected/unavailable posts are recorded as failures.
+best-effort and may change; if it omits photos, the scraper verifies the exact
+status page and uses only full-size `pbs.twimg.com/media` images as a fallback.
+Protected, unavailable, or media-less posts remain failures.
 Instagram `/p/` links now use Playwright automatically. The helper closes normal
 public UI prompts, rewinds to the first slide, clicks Next until the end, and saves
-2x screenshots of the visible image. It does not remove DOM login walls, solve
+2x screenshots after each image decodes and remains stable. It waits up to 60
+seconds per slide by default; set `COMI_INSTAGRAM_IMAGE_TIMEOUT_MS` (5–180 seconds)
+to change the limit. It does not remove DOM login walls, solve
 challenges, load browser cookies, or log in. Manifests and PNGs live in ignored
 `data/instagram-captures/`. The `source_coverage` table records `complete`, `partial`,
 or `blocked`. Slide limits and failed navigation never count as complete. Previously
@@ -165,7 +179,8 @@ journalctl --user -u comi-cf23-scrape.service -f
 ```
 
 The worker reads the existing ignored `.env`. `flock` prevents duplicate copies of
-this service. Each new VLM call checks free quota. Daily exhaustion pauses until
+this service. The sample runs three circles concurrently. Each new VLM call checks
+free quota. Daily exhaustion pauses until
 00:01 UTC; temporary rate limits get a shorter cooldown. There is no paid fallback.
 Partial sources resume from cached images. Each batch checkpoints changed rows to
 D1. At queue exhaustion, failed sources get one final pass before the job records

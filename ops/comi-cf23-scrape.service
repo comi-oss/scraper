@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/ws/cf-oss/scraper
 Environment=PATH=%h/.nvm/versions/node/v24.13.1/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/flock -n %h/ws/cf-oss/scraper/data/all-batches.lock %h/ws/cf-oss/scraper/target/release/comi-scraper scrape-all --event cf23 --batch-size 25 --max-images 20 --interval 4 --upload --wait-for-quota
+ExecStart=/usr/bin/flock -n %h/ws/cf-oss/scraper/data/all-batches.lock %h/ws/cf-oss/scraper/target/release/comi-scraper scrape-all --event cf23 --batch-size 25 --max-images 20 --interval 4 --concurrency 3 --upload --wait-for-quota
 Restart=on-failure
 RestartSec=300
 TimeoutStopSec=30

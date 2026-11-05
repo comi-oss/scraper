@@ -221,10 +221,9 @@ impl<'a> Vlm<'a> {
 
 fn discover(http: &Http, source: &str) -> Result<Vec<(String, Option<Vec<u8>>)>> {
     if let Some(id) = crate::social::x_status(source) {
-        return Ok(crate::social::x_photos(http, &id)?
-            .into_iter()
-            .map(|url| (url, None))
-            .collect());
+        let photos = crate::social::x_photos(http, source, &id)?;
+        println!("X post preflight passed: {} public photo(s)", photos.len());
+        return Ok(photos.into_iter().map(|url| (url, None)).collect());
     }
     if !source.starts_with("https://") && !source.starts_with("http://") {
         let path = Path::new(source);
@@ -267,6 +266,8 @@ pub(crate) fn process(
     let mut browser_complete = false;
     let mut browser_reason = None;
     let images = if crate::instagram::shortcode(source).is_some() {
+        crate::instagram::preflight(http, source)?;
+        println!("Instagram HTTP preflight passed; opening carousel in Playwright");
         let capture = crate::instagram::capture(source, max_images)?;
         db.execute("INSERT INTO source_coverage VALUES (?1,?2,'playwright',?3,?4,?5,?6,?7) ON CONFLICT(circle_id,source_url) DO UPDATE SET method=excluded.method,status=excluded.status,slide_count=excluded.slide_count,manifest_path=excluded.manifest_path,detail=excluded.detail,captured_at=excluded.captured_at",
             params![circle,source,capture.status,i64::try_from(capture.slides.len())?,capture.manifest.to_string_lossy(),capture.reason,capture.captured_at])?;
@@ -306,6 +307,9 @@ pub(crate) fn process(
         let result = (|| -> Result<()> {
             let raw = match raw {
                 Some(raw) => raw,
+                None if crate::social::x_status(source).is_some() => {
+                    crate::social::fetch_with_retry(http, &image)?.bytes
+                }
                 None => http.fetch(&image)?.bytes,
             };
             let jpeg = normalize(&raw).context("could not decode catalog image")?;
